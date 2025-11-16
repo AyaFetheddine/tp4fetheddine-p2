@@ -28,6 +28,7 @@ public class Bb implements Serializable {
     private final StringBuilder conversation = new StringBuilder();
 
     @Inject
+    @Named("llmClient")
     private LlmClient llm;
 
     // === Méthodes principales ===
