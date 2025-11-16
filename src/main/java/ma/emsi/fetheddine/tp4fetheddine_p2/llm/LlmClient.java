@@ -18,12 +18,15 @@ import dev.langchain4j.rag.DefaultRetrievalAugmentor;
 import dev.langchain4j.rag.RetrievalAugmentor;
 import dev.langchain4j.rag.content.retriever.ContentRetriever;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
+import dev.langchain4j.rag.content.retriever.WebSearchContentRetriever;
 import dev.langchain4j.rag.query.router.LanguageModelQueryRouter;
 import dev.langchain4j.rag.query.router.QueryRouter;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
+import dev.langchain4j.web.search.WebSearchEngine;
+import dev.langchain4j.web.search.tavily.TavilyWebSearchEngine;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Named;
 
@@ -36,7 +39,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * MODIFIÉ ÉTAPE 2 : Implémentation du Routage
+ * MODIFIÉ ÉTAPE 3 : Ajout de la Recherche Web
  */
 @ApplicationScoped
 @Named("llmClient")
@@ -47,9 +50,9 @@ public class LlmClient implements Serializable {
     private String systemRole;
 
     public LlmClient() {
-        System.out.println("Initialisation de LlmClient (@ApplicationScoped) avec Routage...");
+        System.out.println("Initialisation de LlmClient (@ApplicationScoped) avec Routage + Web...");
 
-        // Lecture de la clé API
+        // --- Clé Gemini ---
         String envKey = System.getenv("GEMINI_KEY");
         if (envKey == null || envKey.isBlank()) {
             throw new IllegalStateException(
@@ -57,11 +60,17 @@ public class LlmClient implements Serializable {
             );
         }
 
+        // --- Clé Tavily (Web) ---
+        String tavilyKey = System.getenv("TAVILY_KEY");
+        if (tavilyKey == null || tavilyKey.isBlank()) {
+            System.out.println("Avertissement : TAVILY_KEY non définie. La recherche Web sera désactivée.");
+        }
+
         // --- 1. Initialisation des modèles ---
         ChatModel model = GoogleAiGeminiChatModel.builder()
                 .apiKey(envKey)
                 .modelName("gemini-2.5-flash")
-                .temperature(0.3) // Baisser la température pour un routage fiable
+                .temperature(0.3)
                 .logRequests(true)
                 .logResponses(true)
                 .build();
@@ -71,31 +80,40 @@ public class LlmClient implements Serializable {
                 .modelName("text-embedding-004")
                 .build();
 
-        // --- 2. Création de ContentRetrievers SÉPARÉS ---
+        // --- 2. Création des ContentRetrievers (PDFs) ---
         System.out.println("Démarrage de l'ingestion pour le routage...");
-
-        // Retriever pour RAG
         ContentRetriever ragRetriever = createPdfRetriever("rag.pdf", embeddingModel);
         System.out.println("'rag.pdf' ingéré.");
-
-        // Retriever pour le rapport de menaces
         ContentRetriever threatRetriever = createPdfRetriever("threat_report.pdf", embeddingModel);
         System.out.println("'threat_report.pdf' ingéré.");
 
-        // --- 3. Configuration du QueryRouter ---
+        // --- 3. Configuration du QueryRouter (Map) ---
         Map<ContentRetriever, String> retrieverMap = new HashMap<>();
         retrieverMap.put(ragRetriever, "Répond aux questions sur 'Retrieval-Augmented Generation' (RAG), LangChain4j, fine-tuning, et les bases de données vectorielles.");
         retrieverMap.put(threatRetriever, "Répond aux questions sur un rapport de menaces de cybersécurité (threat report), 'vibe hacking', malwares, ransomwares, et les activités de hackers (par ex: Corée du Nord, Chine).");
 
-        QueryRouter queryRouter = new LanguageModelQueryRouter(model, retrieverMap);
+        // --- AJOUT : Retriever Web ---
+        if (tavilyKey != null && !tavilyKey.isBlank()) {
+            WebSearchEngine webSearchEngine = TavilyWebSearchEngine.builder()
+                    .apiKey(tavilyKey)
+                    .build();
+
+            ContentRetriever webRetriever = WebSearchContentRetriever.builder()
+                    .webSearchEngine(webSearchEngine)
+                    .build();
+
+            retrieverMap.put(webRetriever, "Répond aux questions sur l'actualité, les événements récents, la météo, ou des sujets généraux non couverts par les documents fournis.");
+            System.out.println("Recherche Web (Tavily) initialisée et ajoutée au routeur.");
+        }
+        // -----------------------------
 
         // --- 4. Création du RetrievalAugmentor ---
-        // Le RetrievalAugmentor utilise le QueryRouter pour décider quelle source interroger
+        QueryRouter queryRouter = new LanguageModelQueryRouter(model, retrieverMap);
         RetrievalAugmentor retrievalAugmentor = DefaultRetrievalAugmentor.builder()
                 .queryRouter(queryRouter)
                 .build();
 
-        System.out.println("Routage configuré.");
+        System.out.println("Routage final configuré.");
 
         // --- 5. Création de l'Assistant ---
         chatMemory = MessageWindowChatMemory.withMaxMessages(10);
@@ -103,7 +121,7 @@ public class LlmClient implements Serializable {
         assistant = AiServices.builder(Assistant.class)
                 .chatModel(model)
                 .chatMemory(chatMemory)
-                .retrievalAugmentor(retrievalAugmentor) // MODIFIÉ: Utilise l'Augmentor
+                .retrievalAugmentor(retrievalAugmentor) // Utilise l'Augmentor
                 .build();
     }
 
@@ -111,10 +129,7 @@ public class LlmClient implements Serializable {
      * Crée un ContentRetriever pour un seul PDF.
      */
     private ContentRetriever createPdfRetriever(String resourceName, EmbeddingModel embeddingModel) {
-        // Charger le document
         Document document = loadDocumentFromResources(resourceName);
-
-        // Splitter et Ingestor
         DocumentSplitter splitter = DocumentSplitters.recursive(500, 50);
         EmbeddingStore<TextSegment> embeddingStore = new InMemoryEmbeddingStore<>();
 
@@ -125,7 +140,6 @@ public class LlmClient implements Serializable {
                 .build()
                 .ingest(document);
 
-        // Créer le retriever
         return EmbeddingStoreContentRetriever.builder()
                 .embeddingStore(embeddingStore)
                 .embeddingModel(embeddingModel)
@@ -136,7 +150,6 @@ public class LlmClient implements Serializable {
 
     /**
      * Charge un document depuis le dossier "resources" de l'application.
-     * (Identique à l'étape 1)
      */
     private Document loadDocumentFromResources(String resourceName) {
         try {
