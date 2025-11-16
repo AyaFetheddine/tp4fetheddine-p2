@@ -14,8 +14,12 @@ import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.googleai.GoogleAiEmbeddingModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
+import dev.langchain4j.rag.DefaultRetrievalAugmentor;
+import dev.langchain4j.rag.RetrievalAugmentor;
 import dev.langchain4j.rag.content.retriever.ContentRetriever;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
+import dev.langchain4j.rag.query.router.LanguageModelQueryRouter;
+import dev.langchain4j.rag.query.router.QueryRouter;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
@@ -28,11 +32,11 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * Service d'accès centralisé au modèle de langage Gemini via LangChain4j.
- * Gère la mémoire de chat et le rôle système pour maintenir le contexte.
- * MODIFIÉ : Maintenant @ApplicationScoped pour initialiser le RAG une seule fois.
+ * MODIFIÉ ÉTAPE 2 : Implémentation du Routage
  */
 @ApplicationScoped
 @Named("llmClient")
@@ -43,9 +47,9 @@ public class LlmClient implements Serializable {
     private String systemRole;
 
     public LlmClient() {
-        System.out.println("Initialisation de LlmClient (@ApplicationScoped)...");
+        System.out.println("Initialisation de LlmClient (@ApplicationScoped) avec Routage...");
 
-        // Lecture de la clé API depuis les variables d'environnement
+        // Lecture de la clé API
         String envKey = System.getenv("GEMINI_KEY");
         if (envKey == null || envKey.isBlank()) {
             throw new IllegalStateException(
@@ -57,8 +61,8 @@ public class LlmClient implements Serializable {
         ChatModel model = GoogleAiGeminiChatModel.builder()
                 .apiKey(envKey)
                 .modelName("gemini-2.5-flash")
-                .temperature(0.7)
-                .logRequests(true) // Ajout des logs
+                .temperature(0.3) // Baisser la température pour un routage fiable
+                .logRequests(true)
                 .logResponses(true)
                 .build();
 
@@ -67,61 +71,72 @@ public class LlmClient implements Serializable {
                 .modelName("text-embedding-004")
                 .build();
 
-        // --- 2. Création du ContentRetriever (RAG) ---
-        System.out.println("Démarrage de l'ingestion des documents pour le RAG...");
-        ContentRetriever contentRetriever = createCombinedRetriever(embeddingModel);
-        System.out.println("Ingestion terminée.");
+        // --- 2. Création de ContentRetrievers SÉPARÉS ---
+        System.out.println("Démarrage de l'ingestion pour le routage...");
 
-        // --- 3. Création de l'Assistant ---
+        // Retriever pour RAG
+        ContentRetriever ragRetriever = createPdfRetriever("rag.pdf", embeddingModel);
+        System.out.println("'rag.pdf' ingéré.");
+
+        // Retriever pour le rapport de menaces
+        ContentRetriever threatRetriever = createPdfRetriever("threat_report.pdf", embeddingModel);
+        System.out.println("'threat_report.pdf' ingéré.");
+
+        // --- 3. Configuration du QueryRouter ---
+        Map<ContentRetriever, String> retrieverMap = new HashMap<>();
+        retrieverMap.put(ragRetriever, "Répond aux questions sur 'Retrieval-Augmented Generation' (RAG), LangChain4j, fine-tuning, et les bases de données vectorielles.");
+        retrieverMap.put(threatRetriever, "Répond aux questions sur un rapport de menaces de cybersécurité (threat report), 'vibe hacking', malwares, ransomwares, et les activités de hackers (par ex: Corée du Nord, Chine).");
+
+        QueryRouter queryRouter = new LanguageModelQueryRouter(model, retrieverMap);
+
+        // --- 4. Création du RetrievalAugmentor ---
+        // Le RetrievalAugmentor utilise le QueryRouter pour décider quelle source interroger
+        RetrievalAugmentor retrievalAugmentor = DefaultRetrievalAugmentor.builder()
+                .queryRouter(queryRouter)
+                .build();
+
+        System.out.println("Routage configuré.");
+
+        // --- 5. Création de l'Assistant ---
         chatMemory = MessageWindowChatMemory.withMaxMessages(10);
 
         assistant = AiServices.builder(Assistant.class)
                 .chatModel(model)
                 .chatMemory(chatMemory)
-                .contentRetriever(contentRetriever) // INJECTION DU RAG
+                .retrievalAugmentor(retrievalAugmentor) // MODIFIÉ: Utilise l'Augmentor
                 .build();
     }
 
     /**
-     * Crée un ContentRetriever unique contenant les deux PDF.
+     * Crée un ContentRetriever pour un seul PDF.
      */
-    private ContentRetriever createCombinedRetriever(EmbeddingModel embeddingModel) {
-        EmbeddingStore<TextSegment> embeddingStore = new InMemoryEmbeddingStore<>();
+    private ContentRetriever createPdfRetriever(String resourceName, EmbeddingModel embeddingModel) {
+        // Charger le document
+        Document document = loadDocumentFromResources(resourceName);
+
+        // Splitter et Ingestor
         DocumentSplitter splitter = DocumentSplitters.recursive(500, 50);
+        EmbeddingStore<TextSegment> embeddingStore = new InMemoryEmbeddingStore<>();
 
-        // Ingestion de rag.pdf
-        Document ragPdf = loadDocumentFromResources("rag.pdf");
         EmbeddingStoreIngestor.builder()
                 .documentSplitter(splitter)
                 .embeddingModel(embeddingModel)
                 .embeddingStore(embeddingStore)
                 .build()
-                .ingest(ragPdf);
+                .ingest(document);
 
-        System.out.println("Document 'rag.pdf' ingéré.");
-
-        // Ingestion de threat_report.pdf
-        Document threatReportPdf = loadDocumentFromResources("threat_report.pdf");
-        EmbeddingStoreIngestor.builder()
-                .documentSplitter(splitter)
-                .embeddingModel(embeddingModel)
-                .embeddingStore(embeddingStore)
-                .build()
-                .ingest(threatReportPdf);
-
-        System.out.println("Document 'threat_report.pdf' ingéré.");
-
-        // Création du retriever
+        // Créer le retriever
         return EmbeddingStoreContentRetriever.builder()
                 .embeddingStore(embeddingStore)
                 .embeddingModel(embeddingModel)
-                .maxResults(3) // Récupérer les 3 segments les plus pertinents
-                .minScore(0.6) // Seuil de similarité minimum
+                .maxResults(3)
+                .minScore(0.6)
                 .build();
     }
 
     /**
      * Charge un document depuis le dossier "resources" de l'application.
+     * (Identique à l'étape 1)
      */
     private Document loadDocumentFromResources(String resourceName) {
         try {
